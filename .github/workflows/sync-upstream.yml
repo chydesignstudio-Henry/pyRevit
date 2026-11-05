@@ -1,0 +1,88 @@
+name: Sync upstream
+
+on:
+  schedule:
+    - cron: '0 19 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Merge upstream into develop
+        shell: bash
+        env:
+          SYNC_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+          USING_SYNC_SECRET: ${{ secrets.UPSTREAM_SYNC_TOKEN != '' }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${USING_SYNC_SECRET}" == "true" ]]; then
+            echo "Calling merge-upstream with the UPSTREAM_SYNC_TOKEN secret."
+          else
+            echo "Calling merge-upstream with GITHUB_TOKEN."
+          fi
+
+          response_file="$(mktemp)"
+          http_code="$(
+            curl -sS -o "${response_file}" -w "%{http_code}" \
+              -X POST \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${SYNC_TOKEN}" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "https://api.github.com/repos/${REPO}/merge-upstream" \
+              --data '{"branch":"develop"}'
+          )"
+
+          echo "merge-upstream returned HTTP ${http_code}"
+          cat "${response_file}"
+          echo
+
+          if [[ "${http_code}" =~ ^2 ]]; then
+            echo "Synced the develop branch with upstream."
+            exit 0
+          fi
+
+          if [[ "${http_code}" == "409" ]]; then
+            echo "::error::Merge conflict while syncing upstream into develop. This workflow never force-pushes; resolve the conflict on develop manually."
+            has_issues="$(gh api "repos/${REPO}" --jq '.has_issues' || true)"
+            if [[ "${has_issues}" == "true" ]]; then
+              existing="$(gh issue list --repo "${REPO}" --state open --limit 50 --search "in:title Upstream sync conflict on develop" --json title --jq '[.[] | select(.title == "Upstream sync conflict on develop")] | length' || true)"
+              if [[ -z "${existing}" || "${existing}" == "0" ]]; then
+                parent="$(gh api "repos/${REPO}" --jq '.parent.full_name // "the upstream repository"' || true)"
+                upstream_name="${parent:-the upstream repository}"
+                issue_body="$(
+                  printf '%s\n' \
+                    "The scheduled sync could not merge \`develop\` from ${upstream_name} into this fork (HTTP 409 merge conflict)." \
+                    "" \
+                    "This workflow calls the merge-upstream API and never force-pushes. Resolve the conflict on \`develop\`, then re-run the Sync upstream workflow." \
+                    "" \
+                    "Run: ${GITHUB_SERVER_URL}/${REPO}/actions/runs/${GITHUB_RUN_ID}"
+                )"
+                gh issue create \
+                  --repo "${REPO}" \
+                  --title "Upstream sync conflict on develop" \
+                  --body "${issue_body}"
+              else
+                echo "An open issue already tracks this upstream sync conflict."
+              fi
+            elif [[ "${has_issues}" == "false" ]]; then
+              echo "Issues are disabled on this repository; not opening an issue."
+            else
+              echo "Could not determine whether issues are enabled; not opening an issue."
+            fi
+            exit 1
+          fi
+
+          if [[ "${http_code}" == "422" ]]; then
+            echo "::error::Upstream changed workflow files, so this sync cannot update them. Press 'Sync fork' on GitHub, or add an UPSTREAM_SYNC_TOKEN secret (a PAT with the workflow scope) and run this workflow again."
+            exit 1
+          fi
+
+          echo "::error::merge-upstream failed with HTTP ${http_code}."
+          exit 1
