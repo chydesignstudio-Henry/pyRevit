@@ -25,7 +25,7 @@ namespace PyRevitLabs.PyRevit.Runtime.Agent {
     /// have errors, in every non-linked document, so a failure in a family or a new document
     /// fails the run with Revit's message instead of raising a dialog;</item>
     /// <item>closes Revit dialogs instead of letting them block the main thread;</item>
-    /// <item>cancels synchronize, save, save-as, file-export and view-export operations while
+    /// <item>cancels synchronize, save, save-as, file-export, view-export and print operations while
     /// armed when Revit marks their event cancellable. It cancels closing only for documents
     /// that were open when the run started.</item>
     /// </list>
@@ -72,6 +72,17 @@ namespace PyRevitLabs.PyRevit.Runtime.Agent {
         public bool HasOpenGroup => group != null && group.HasStarted() && !group.HasEnded();
 
         /// <summary>
+        /// True once the active document's group was assimilated, so its changes are kept.
+        /// </summary>
+        public bool Committed { get; private set; }
+
+        /// <summary>
+        /// True when rolling back the active document's group threw or did not report it rolled
+        /// back, so the run's changes may still be in the model.
+        /// </summary>
+        public bool RollbackFailed { get; private set; }
+
+        /// <summary>
         /// True when the script changed a document that was already open when the run started.
         /// Those changes are outside what the run may keep, so the run must fail.
         /// </summary>
@@ -93,6 +104,7 @@ namespace PyRevitLabs.PyRevit.Runtime.Agent {
             app.DocumentSavingAs += OnDocumentSavingAs;
             app.FileExporting += OnFileExporting;
             app.ViewExporting += OnViewExporting;
+            app.DocumentPrinting += OnDocumentPrinting;
             app.DocumentCreated += OnDocumentCreated;
             app.DocumentOpened += OnDocumentOpened;
             app.DocumentClosing += OnDocumentClosing;
@@ -114,31 +126,41 @@ namespace PyRevitLabs.PyRevit.Runtime.Agent {
                 return;
 
             group = new TransactionGroup(doc, groupName);
-            group.Start();
+            if (group.Start() != TransactionStatus.Started)
+                throw new InvalidOperationException(
+                    "Revit did not start the run's transaction group on the active document, so the run could not be rolled back; the script was not run.");
         }
 
-        /// <summary>
-        /// Stops auto-closing dialogs, so the approval prompt shown by the host itself stays
-        /// visible.
-        /// </summary>
-        public void DisarmDialogCapture() {
+        private void DisarmDialogCapture() {
             dialogCapture?.Disarm();
         }
 
         public void RollBack() {
             try {
-                if (HasOpenGroup)
-                    group.RollBack();
+                RollBackGroup();
             }
             finally {
                 RollBackOtherDocuments();
             }
         }
 
+        private void RollBackGroup() {
+            try {
+                if (HasOpenGroup && group.RollBack() != TransactionStatus.RolledBack)
+                    RollbackFailed = true;
+            }
+            catch (Exception) {
+                RollbackFailed = true;
+                throw;
+            }
+        }
+
         public void Assimilate() {
             RollBackOtherDocuments();
-            if (HasOpenGroup)
+            if (HasOpenGroup) {
                 group.Assimilate();
+                Committed = true;
+            }
         }
 
         /// <summary>
@@ -168,10 +190,10 @@ namespace PyRevitLabs.PyRevit.Runtime.Agent {
 
         public void Dispose() {
             try {
-                if (HasOpenGroup)
-                    group.RollBack();
+                RollBackGroup();
             }
-            catch (Exception) {
+            catch (Exception ex) {
+                CleanupFailures.Add("Rolling back the run failed: " + ex.Message);
             }
             finally {
                 TryCleanup(() => group?.Dispose());
@@ -186,6 +208,7 @@ namespace PyRevitLabs.PyRevit.Runtime.Agent {
                     app.DocumentSavingAs -= OnDocumentSavingAs;
                     app.FileExporting -= OnFileExporting;
                     app.ViewExporting -= OnViewExporting;
+                    app.DocumentPrinting -= OnDocumentPrinting;
                     app.DocumentCreated -= OnDocumentCreated;
                     app.DocumentOpened -= OnDocumentOpened;
                     app.DocumentClosing -= OnDocumentClosing;
@@ -296,6 +319,10 @@ namespace PyRevitLabs.PyRevit.Runtime.Agent {
 
         private void OnViewExporting(object sender, ViewExportingEventArgs e) {
             Block(e, null, "view_export");
+        }
+
+        private void OnDocumentPrinting(object sender, DocumentPrintingEventArgs e) {
+            Block(e, e.Document, "print");
         }
 
         private bool IsProtectedFromSave(Document target) {
@@ -470,10 +497,16 @@ namespace PyRevitLabs.PyRevit.Runtime.Agent {
         /// Summarizes the change set. Must be called while the group is still open, because
         /// added and modified elements no longer exist in their changed form after a rollback.
         /// </summary>
+        /// <remarks>
+        /// <c>added_families</c> lists loaded families and types found among all added
+        /// elements, not only the first <paramref name="maxSamples"/>, so a family load stays
+        /// reviewable when regeneration adds many other elements.
+        /// </remarks>
         public JObject Describe(Document doc, int maxSamples) {
             var description = Summarize();
             description["by_category"] = CountByCategory(doc);
             description["added"] = DescribeElements(doc, added, maxSamples);
+            description["added_families"] = DescribeElements(doc, added.Where(id => IsFamilyOrType(doc.GetElement(id))), maxSamples);
             description["modified"] = DescribeElements(doc, modified, maxSamples);
             description["deleted"] = new JArray(deleted.Take(maxSamples).Select(AgentIds.ToValue));
             return description;
@@ -512,6 +545,10 @@ namespace PyRevitLabs.PyRevit.Runtime.Agent {
                 });
             }
             return described;
+        }
+
+        private static bool IsFamilyOrType(Element element) {
+            return element is Family || element is FamilySymbol;
         }
 
         private static string SafeName(Element element) {
