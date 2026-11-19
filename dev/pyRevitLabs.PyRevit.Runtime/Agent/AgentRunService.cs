@@ -5,10 +5,13 @@ using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 
 using Autodesk.Revit.DB;
 using Autodesk.Revit.UI;
 
+using pyRevitLabs.Common;
 using pyRevitLabs.Json;
 using pyRevitLabs.Json.Linq;
 using pyRevitLabs.NLog;
@@ -61,6 +64,7 @@ namespace PyRevitLabs.PyRevit.Runtime.Agent {
         private const int MaxResultChars = 256 * 1024;
         private const int MaxOutputChars = 64 * 1024;
         private const int MaxChangeSamples = 50;
+        private const string ExportDirName = "exports";
 
         private static AgentPolicy ReadPolicy() {
             var policy = PyRevitConfigs.GetAgentPolicy();
@@ -95,12 +99,13 @@ namespace PyRevitLabs.PyRevit.Runtime.Agent {
 
         private static AgentRunVerdict CarryOut(
             AgentRunVerdict verdict, AgentRunGuard guard, AgentScriptContext context, UIDocument uidoc,
-            AgentRunRequest request, string runId, int exitCode, JObject changes, AgentTabHighlight.Lease highlight,
+            AgentRunRequest request, string runId, string runDir, int exitCode, JObject changes, AgentTabHighlight.Lease highlight,
             AgentRunTimings timings) {
             switch (verdict) {
                 case AgentRunVerdict.TransactionLeftOpen:
                     SetErrorIfMissing(context, "transaction_left_open",
                         "The script left a transaction open. Commit or roll back every transaction it starts.");
+                    RollBackLeftOpenRun(guard, context, runId);
                     return verdict;
                 case AgentRunVerdict.ScriptFailed:
                     SetErrorIfMissing(context, "engine_error",
@@ -119,33 +124,74 @@ namespace PyRevitLabs.PyRevit.Runtime.Agent {
                 case AgentRunVerdict.QueryModifiedModel:
                     guard.RollBack();
                     context.SetError("query_modified_model",
-                        "A query run changed the model. The changes were rolled back; use mode 'dry_run' or 'modify'.",
+                        guard.RollbackFailed
+                            ? "A query run changed the model and the host could not roll the changes back, so they may remain in the active document. "
+                                + "Ask the user to undo them in Revit or close the document without saving; use mode 'dry_run' or 'modify' for changes."
+                            : "A query run changed the model. The changes were rolled back; use mode 'dry_run' or 'modify'.",
                         null);
                     return verdict;
                 case AgentRunVerdict.PolicyReadOnly:
-                    context.SetError("policy_readonly",
-                        "The pyRevit agent policy changed to 'readonly' during the run; its changes were rolled back.",
-                        null);
-                    guard.RollBack();
+                    try {
+                        guard.RollBack();
+                    }
+                    finally {
+                        context.SetError("policy_readonly",
+                            guard.RollbackFailed
+                                ? "The pyRevit agent policy changed to 'readonly' during the run and the host could not roll its changes back, so they may remain in the active document. "
+                                    + "Ask the user to undo them in Revit or close the document without saving."
+                                : "The pyRevit agent policy changed to 'readonly' during the run; its changes were rolled back.",
+                            null);
+                    }
                     return verdict;
                 case AgentRunVerdict.AutoCommit:
                     Commit(guard, uidoc.Document, request, runId);
                     return verdict;
                 case AgentRunVerdict.AskUser:
                     timings.Lap("decide");
+                    AgentPendingRecord.Write(request, runId, runDir);
                     AgentHost.AwaitTabApproval(highlight);
-                    var approved = AgentApproval.Ask(uidoc, request.Title, guard.Changes, changes, guard.Failures);
+                    var answer = AgentApproval.Ask(uidoc, request.Title, guard.Changes, changes, guard.Failures, request.CallerGone);
                     timings.Lap("approval");
-                    if (approved) {
+                    if (answer == AgentApprovalAnswer.Approved) {
                         Commit(guard, uidoc.Document, request, runId);
                         return AgentRunVerdict.UserApproved;
                     }
                     guard.RollBack();
-                    return AgentRunVerdict.UserDiscarded;
+                    return answer == AgentApprovalAnswer.CallerGone
+                        ? AgentRunVerdict.DiscardedCallerGone
+                        : AgentRunVerdict.UserDiscarded;
                 default:
                     guard.RollBack();
                     return verdict;
             }
+        }
+
+        /// <summary>
+        /// Rolls back a run whose script left a transaction open, and adds the reason to the
+        /// run's error when the rollback fails.
+        /// </summary>
+        /// <remarks>
+        /// Revit may refuse to roll back the group while an inner transaction is still open or
+        /// pending. That refusal must not become a <c>host_error</c>: the error keeps its type and
+        /// gains the reason, and <c>decision</c> becomes <c>rollback_incomplete</c> from
+        /// <see cref="AgentRunGuard.RollbackFailed"/>. The host never holds or finishes the
+        /// script's own transactions.
+        /// </remarks>
+        private static void RollBackLeftOpenRun(AgentRunGuard guard, AgentScriptContext context, string runId) {
+            try {
+                guard.RollBack();
+            }
+            catch (Exception ex) {
+                logger.Error(ex, "Agent run {0}: rolling back a run that left a transaction open failed", runId);
+                if (!guard.RollbackFailed)
+                    guard.CleanupFailures.Add("Rolling back another document failed: " + ex.Message);
+            }
+            if (guard.RollbackFailed)
+                context.SetError(
+                    context.ErrorType,
+                    context.ErrorMessage + " The host could not roll back the run either, so its changes may remain "
+                        + "in the active document: " + guard.RollbackFailureReason,
+                    context.ErrorTraceback);
         }
 
         private static void Commit(AgentRunGuard guard, Document doc, AgentRunRequest request, string runId) {
@@ -176,6 +222,8 @@ namespace PyRevitLabs.PyRevit.Runtime.Agent {
             var timings = new AgentRunTimings((Stopwatch.GetTimestamp() - request.ReceivedTimestamp) * 1000.0 / Stopwatch.Frequency);
             var uidoc = app.ActiveUIDocument;
             var doc = uidoc?.Document;
+            if (request.Document != null && (doc == null || !AgentDocumentBinding.Matches(request.Document, doc.Title, doc.PathName)))
+                throw AgentDocumentBinding.Refusal(request.Document, doc?.Title);
             if (doc == null && request.Mode == AgentRunMode.Modify)
                 throw new AgentException("no_active_document", "A modify run requires an active document.");
             if (doc != null && doc.IsReadOnly && request.Mode != AgentRunMode.Query)
@@ -200,6 +248,7 @@ namespace PyRevitLabs.PyRevit.Runtime.Agent {
                 var runId = Guid.NewGuid().ToString("N").Substring(0, 12);
                 var runDir = AgentPaths.CreateRunDir(runId);
                 WriteRequestRecord(runDir, request);
+                var exportDir = Directory.CreateDirectory(Path.Combine(runDir, ExportDirName)).FullName;
 
                 var warnings = new JArray();
                 var lostBefore = doc == null ? null : AgentCommitSentinel.Check(doc, afterRollback: false);
@@ -209,6 +258,7 @@ namespace PyRevitLabs.PyRevit.Runtime.Agent {
                 var stopwatch = Stopwatch.StartNew();
                 var context = new AgentScriptContext(app, runId, request.ModeName, request.Script, request.InputsJson, request.Workspace, request.TimeoutSeconds, reckless) {
                     Timings = timings,
+                    ExportDir = exportDir + Path.DirectorySeparatorChar,
                 };
                 var response = new JObject {
                     ["run_id"] = runId,
@@ -219,8 +269,7 @@ namespace PyRevitLabs.PyRevit.Runtime.Agent {
                 };
 
                 timings.Lap("prepare");
-                var openAtStart = AgentDocuments.Snapshot(app.Application);
-                var guard = new AgentRunGuard(app, doc);
+                var guard = new AgentRunGuard(app, doc, exportDir);
                 using (guard) {
                     try {
                         guard.Arm("Agent: " + request.Title);
@@ -254,14 +303,14 @@ namespace PyRevitLabs.PyRevit.Runtime.Agent {
                             Policy = AgentRunDecision.Stricter(policyAtStart, policyInForce.Tighten(ReadPolicy())),
                         });
                         timings.Lap("decide");
-                        verdict = CarryOut(verdict, guard, context, uidoc, request, runId, exitCode, changes, highlight, timings);
+                        verdict = CarryOut(verdict, guard, context, uidoc, request, runId, runDir, exitCode, changes, highlight, timings);
                         timings.Lap("guard_release");
 
                         var approval = AgentRunDecision.Approval(verdict);
                         if (approval != null)
                             response["approval"] = approval;
                         response["status"] = AgentRunDecision.Status(verdict);
-                        response["decision"] = AgentRunDecision.Decision(verdict);
+                        response["decision"] = AgentRunDecision.Decision(verdict, context.Started);
                         response["exit_code"] = exitCode;
                         response["changes"] = changes;
                         response["failures"] = guard.Failures;
@@ -272,7 +321,7 @@ namespace PyRevitLabs.PyRevit.Runtime.Agent {
                         logger.Error(ex, "Agent run {0} failed in the host", runId);
                         context.SetError("host_error", ex.Message, ex.ToString());
                         response["status"] = "error";
-                        response["decision"] = guard.Committed ? "committed" : "rolled_back";
+                        response["decision"] = AgentRunDecision.AfterHostError(guard.Committed, context.Started);
                         response["failures"] = guard.Failures;
                         response["dialogs"] = guard.Dialogs;
                         response["blocked"] = guard.Blocked;
@@ -282,12 +331,13 @@ namespace PyRevitLabs.PyRevit.Runtime.Agent {
                 if (guard.RollbackFailed) {
                     response["status"] = "error";
                     response["decision"] = "rollback_incomplete";
+                    response["rollback_failure"] = guard.RollbackFailureReason;
                     SetErrorIfMissing(context, "rollback_incomplete",
                         "The host could not roll back the run, so its changes may remain in the active document. "
                         + "Ask the user to undo them in Revit or close the document without saving.");
                 }
 
-                if (doc != null && !guard.RollbackFailed && response.Value<string>("decision") != "committed") {
+                if (doc != null && context.Started && !guard.RollbackFailed && response.Value<string>("decision") != "committed") {
                     var lostByRollback = AgentCommitSentinel.Check(doc, afterRollback: true);
                     if (lostByRollback != null) {
                         logger.Error("Agent run {0}: {1}", runId, lostByRollback);
@@ -295,7 +345,7 @@ namespace PyRevitLabs.PyRevit.Runtime.Agent {
                     }
                 }
                 try {
-                    var leftovers = AgentDocuments.CloseLeftovers(app.Application, openAtStart);
+                    var leftovers = AgentDocuments.CloseLeftovers(app.Application, guard.OpenAtStart);
                     response["closed_documents"] = leftovers["closed"];
                     response["unclosed_documents"] = leftovers["failed"];
                     if (((JArray)leftovers["failed"]).Count > 0)
@@ -309,6 +359,17 @@ namespace PyRevitLabs.PyRevit.Runtime.Agent {
                 var finalOtherDocuments = guard.DescribeOtherDocuments();
                 foreach (var failure in guard.CleanupFailures)
                     warnings.Add("Guard cleanup failed: " + failure);
+                try {
+                    var exports = AgentExportCollector.Collect(exportDir);
+                    if (exports.Length > 0)
+                        response["exports"] = new JArray(exports);
+                }
+                catch (Exception ex) {
+                    warnings.Add("Listing the run's exports failed: " + ex.Message);
+                }
+                var blockedExplanation = guard.DescribeBlockedOperations();
+                if (blockedExplanation != null)
+                    warnings.Add(blockedExplanation);
                 if (finalOtherDocuments.Count > 0) {
                     var changes = response["changes"] as JObject;
                     if (changes == null) {
@@ -344,6 +405,7 @@ namespace PyRevitLabs.PyRevit.Runtime.Agent {
                     warnings.Add("Could not write the agent run record: " + ex.Message);
                 }
 
+                AgentRecorder.RecordAgentRun(response);
                 return response;
             }
             finally {
@@ -357,7 +419,8 @@ namespace PyRevitLabs.PyRevit.Runtime.Agent {
         }
 
         /// <summary>
-        /// Leaves a run folder for a request the host refused as <c>revit_busy</c>, with
+        /// Leaves a run folder for a request the host refused before running any of it
+        /// (<c>revit_busy</c> or <c>document_changed</c>), with
         /// <c>status</c> and <c>decision</c> <c>not_run</c>, and adds its <c>run_id</c> and
         /// <c>run_dir</c> to <paramref name="refusal"/>.
         /// </summary>
@@ -412,7 +475,7 @@ namespace PyRevitLabs.PyRevit.Runtime.Agent {
                         response["result_path"] = resultPath;
                     }
                     else {
-                        response["result"] = JToken.Parse(context.ResultJson);
+                        response["result"] = JsonText.Parse(context.ResultJson);
                     }
                 }
                 catch (Exception ex) {
@@ -441,6 +504,12 @@ namespace PyRevitLabs.PyRevit.Runtime.Agent {
         }
     }
 
+    internal enum AgentApprovalAnswer {
+        Approved,
+        Declined,
+        CallerGone,
+    }
+
     /// <summary>
     /// Asks the user, inside Revit, whether to keep the changes of a modify run.
     /// </summary>
@@ -457,6 +526,26 @@ namespace PyRevitLabs.PyRevit.Runtime.Agent {
         private const int MaxListedCategories = 15;
         private const uint YesNoQuestionDefaultNo = 0x4 | 0x20 | 0x100;
         private const int Yes = 6;
+
+        private static readonly Logger logger = LogManager.GetCurrentClassLogger();
+        private const string PromptCaption = "pyRevit Agent";
+
+        private delegate bool EnumThreadWindowsProc(IntPtr window, IntPtr parameter);
+
+        [DllImport("kernel32.dll")]
+        private static extern uint GetCurrentThreadId();
+
+        [DllImport("user32.dll")]
+        private static extern bool EnumThreadWindows(uint threadId, EnumThreadWindowsProc callback, IntPtr parameter);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern int GetWindowText(IntPtr window, StringBuilder text, int maxCount);
+
+        [DllImport("user32.dll")]
+        private static extern bool IsWindowVisible(IntPtr window);
+
+        [DllImport("user32.dll")]
+        private static extern bool PostMessage(IntPtr window, uint message, IntPtr wParam, IntPtr lParam);
 
         [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         private static extern int MessageBox(IntPtr owner, string text, string caption, uint type);
@@ -478,15 +567,33 @@ namespace PyRevitLabs.PyRevit.Runtime.Agent {
 
         internal static string Name(AgentPolicy policy) => policy.ToString().ToLowerInvariant();
 
-        public static bool Ask(UIDocument uidoc, string title, AgentChangeSet changeSet, JObject changes, JArray failures) {
+        /// <summary>
+        /// Shows the approval prompt and returns the user's answer, or
+        /// <see cref="AgentApprovalAnswer.CallerGone"/> when <paramref name="callerGone"/> is
+        /// cancelled first.
+        /// </summary>
+        /// <remarks>
+        /// Cancelling the token before the prompt opens skips it; cancelling it while the prompt is
+        /// up closes the prompt as if the user had chosen No. An answer the user gave before the
+        /// prompt closed still counts.
+        /// </remarks>
+        public static AgentApprovalAnswer Ask(
+            UIDocument uidoc, string title, AgentChangeSet changeSet, JObject changes, JArray failures, CancellationToken callerGone) {
+            if (callerGone.IsCancellationRequested)
+                return AgentApprovalAnswer.CallerGone;
             var previousSelection = uidoc.Selection.GetElementIds();
             var preview = AgentViewPreview.Show(uidoc, changeSet.Touched);
 
             var text = "An agent wants to modify the model." + Environment.NewLine + Environment.NewLine
-                + BuildSummary(title, changes, failures, preview.Description) + Environment.NewLine + Environment.NewLine
+                + BuildSummary(uidoc.Document.Title, title, changes, failures, preview.Description) + Environment.NewLine + Environment.NewLine
                 + "Keep these changes? Yes commits them as a single undoable operation. "
                 + "No rolls the model back to its state before the run.";
-            var approved = MessageBox(uidoc.Application.MainWindowHandle, text, "pyRevit Agent", YesNoQuestionDefaultNo) == Yes;
+            var dismissal = new PromptDismissal(GetCurrentThreadId());
+            bool approved;
+            using (callerGone.Register(() => Task.Run(dismissal.Run))) {
+                approved = MessageBox(uidoc.Application.MainWindowHandle, text, PromptCaption, YesNoQuestionDefaultNo) == Yes;
+                dismissal.PromptClosed();
+            }
             try {
                 preview.End();
             }
@@ -499,11 +606,72 @@ namespace PyRevitLabs.PyRevit.Runtime.Agent {
                 catch (Exception) {
                 }
             }
-            return approved;
+            if (approved)
+                return AgentApprovalAnswer.Approved;
+            return dismissal.Sent ? AgentApprovalAnswer.CallerGone : AgentApprovalAnswer.Declined;
         }
 
-        private static string BuildSummary(string title, JObject changes, JArray failures, string previewDescription) {
+        /// <summary>
+        /// Closes the approval prompt for a caller that is gone and reports whether it did.
+        /// </summary>
+        /// <remarks>
+        /// Invariant: <see cref="Sent"/> is set before the close command is posted and cleared only
+        /// if posting fails. Posting wakes the main thread, which reads <see cref="Sent"/> as soon
+        /// as the prompt returns, so setting it afterwards could record <c>discarded</c> for a
+        /// prompt this closed.
+        /// </remarks>
+        private sealed class PromptDismissal {
+            private const int Attempts = 50;
+            private const int AttemptDelayMilliseconds = 40;
+            private const uint WmCommand = 0x0111;
+            private const int IdNo = 7;
+            private readonly uint threadId;
+            private volatile bool closed;
+            private volatile bool sent;
+
+            public PromptDismissal(uint threadId) {
+                this.threadId = threadId;
+            }
+
+            public bool Sent => sent;
+
+            public void PromptClosed() {
+                closed = true;
+            }
+
+            public void Run() {
+                for (var attempt = 0; attempt < Attempts && !closed; attempt++) {
+                    var prompt = FindPrompt();
+                    if (prompt != IntPtr.Zero) {
+                        sent = true;
+                        if (!PostMessage(prompt, WmCommand, (IntPtr)IdNo, IntPtr.Zero))
+                            sent = false;
+                        return;
+                    }
+                    Thread.Sleep(AttemptDelayMilliseconds);
+                }
+                if (!closed && !sent)
+                    logger.Warn("The approval prompt window was not found, so it stays up for a caller that is gone");
+            }
+
+            private IntPtr FindPrompt() {
+                var found = IntPtr.Zero;
+                var caption = new StringBuilder(PromptCaption.Length + 2);
+                EnumThreadWindows(threadId, (window, _) => {
+                    caption.Clear();
+                    if (GetWindowText(window, caption, caption.Capacity) > 0 && caption.ToString() == PromptCaption && IsWindowVisible(window)) {
+                        found = window;
+                        return false;
+                    }
+                    return true;
+                }, IntPtr.Zero);
+                return found;
+            }
+        }
+
+        private static string BuildSummary(string documentTitle, string title, JObject changes, JArray failures, string previewDescription) {
             var summary = new StringBuilder();
+            summary.AppendLine("Document: " + documentTitle);
             summary.AppendLine(string.Format(
                 "Added: {0}   Modified: {1}   Deleted: {2}",
                 changes.Value<int>("added_count"),
@@ -577,9 +745,11 @@ namespace PyRevitLabs.PyRevit.Runtime.Agent {
 
             try {
                 using (var transaction = new Transaction(doc, TransactionName)) {
-                    transaction.Start();
+                    if (transaction.Start() != TransactionStatus.Started)
+                        throw new InvalidOperationException("Revit did not start the approval preview's temporary isolation.");
                     view.IsolateElementsTemporary(visibleCandidates);
-                    transaction.Commit();
+                    if (transaction.Commit() != TransactionStatus.Committed)
+                        throw new InvalidOperationException("Revit did not commit the approval preview's temporary isolation.");
                 }
                 uidoc.RefreshActiveView();
                 return new AgentViewPreview(doc, view,

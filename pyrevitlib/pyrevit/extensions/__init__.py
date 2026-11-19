@@ -112,6 +112,7 @@ MDATA_LINK_BUTTON_ASSEMBLY = "assembly"
 MDATA_LINK_BUTTON_COMMAND_CLASS = "command_class"
 MDATA_LINK_BUTTON_AVAIL_COMMAND_CLASS = "availability_class"
 MDATA_URL_BUTTON_HYPERLINK = "hyperlink"
+MDATA_CHECKBOX_CHECKED = "checked"
 MDATA_TEMPLATES_KEY = "templates"
 MDATA_BACKGROUND_KEY = "background"
 MDATA_BACKGROUND_PANEL_KEY = "panel"
@@ -162,12 +163,14 @@ NOGUI_COMMAND_POSTFIX = ".nobutton"
 CONTENT_BUTTON_POSTFIX = ".content"
 URL_BUTTON_POSTFIX = ".urlbutton"
 COMBOBOX_POSTFIX = ".combobox"
+CHECKBOX_POSTFIX = ".checkbox"
 
 # known bundle sub-directories
 COMP_LIBRARY_DIR_NAME = "lib"
 COMP_BIN_DIR_NAME = "bin"
 COMP_HOOKS_DIR_NAME = "hooks"
 COMP_CHECKS_DIR_NAME = "checks"
+COMP_CHECK_POSTFIX = "_check.py"
 
 # unique ids
 UNIQUE_ID_SEPARATOR = "_"

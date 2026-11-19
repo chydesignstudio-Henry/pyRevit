@@ -35,10 +35,31 @@ namespace pyRevitCLI {
         public string Engine { get; set; }
         public string EngineVersion { get; set; }
         public string Commit { get; set; }
+
+        /// <summary>Commit the runtime binaries were built from; null when the host did not record it.</summary>
+        public string BinCommit { get; set; }
+
+        /// <summary>True when the binaries were built from another commit than the clone, so a rebuild is due.</summary>
+        public bool BinStale { get; set; }
+
+        /// <summary>Git branch of the clone, or the branch its image was deployed from; null when the host did not record it.</summary>
+        public string Branch { get; set; }
         public string ConfigRoot { get; set; }
 
         /// <summary>True for a session started by <c>pyrevit launch</c> rather than through the shared attachment.</summary>
         public bool PerLaunch { get; set; }
+
+        /// <summary>
+        /// Replaces the clone commit and binary fields recorded at startup with the live ones from a
+        /// <c>ping</c> answered with <c>identity</c>. A host that does not send them keeps the recorded values.
+        /// </summary>
+        public void Refresh(JObject pong) {
+            if (pong == null || !pong.ContainsKey("commit"))
+                return;
+            Commit = pong.Value<string>("commit");
+            BinCommit = pong.Value<string>("bin_commit");
+            BinStale = pong.Value<bool?>("bin_stale") ?? false;
+        }
 
         public JObject ToJson() {
             var json = new JObject {
@@ -53,6 +74,10 @@ namespace pyRevitCLI {
                 json["engine"] = Engine;
                 json["engine_version"] = EngineVersion;
                 json["commit"] = Commit;
+                json["bin_commit"] = BinCommit;
+                if (BinStale)
+                    json["bin_stale"] = true;
+                json["branch"] = Branch;
                 json["config_root"] = ConfigRoot;
                 json["per_launch"] = PerLaunch;
             }
@@ -156,8 +181,9 @@ namespace pyRevitCLI {
     /// discovery of running hosts and of recorded runs.
     /// </summary>
     /// <remarks>
-    /// Each call opens its own pipe connection. The host serves one connection at a time,
-    /// so callers that may overlap (the MCP server) must serialize their calls to each host.
+    /// Each call opens its own pipe connection. The host runs one request at a time, and hosts
+    /// older than the multi-connection pipe server also accept one connection at a time, so
+    /// callers that may overlap (the MCP server) must serialize their calls to each host.
     /// </remarks>
     internal static class PyRevitAgentClient {
         private static readonly Encoding Utf8 = new UTF8Encoding(false);
@@ -177,8 +203,9 @@ namespace pyRevitCLI {
         internal static int PingTimeoutMs = 5000;
 
         /// <summary>
-        /// How long <see cref="Ping"/> waits for the host's pipe. A host serving another client
-        /// never accepts, so a ping must not wait the full <see cref="ConnectTimeoutMs"/>.
+        /// How long <see cref="Ping"/> waits for the host's pipe. A host whose server instances
+        /// all serve other clients never accepts, so a ping must not wait the full
+        /// <see cref="ConnectTimeoutMs"/>.
         /// Shortened by tests.
         /// </summary>
         internal static int PingConnectTimeoutMs = 1500;
@@ -196,7 +223,8 @@ namespace pyRevitCLI {
         /// </summary>
         /// <remarks>
         /// Invariant: never open the pipe to check it. Opening it, as <c>File.Exists</c> does,
-        /// connects to the host's only server instance and can lock a real client out.
+        /// takes one of the host's few server instances (an older host has only one) and can
+        /// lock a real client out.
         /// </remarks>
         internal static Func<string, bool> PipeExists = pipeName => Directory.EnumerateFiles(PipeRoot)
             .Any(path => string.Equals(path, PipeRoot + pipeName, StringComparison.OrdinalIgnoreCase));
@@ -213,6 +241,8 @@ namespace pyRevitCLI {
         public static string AgentDir => AgentDirOverride ?? PyRevitLabsConsts.AgentPath;
         public static string InstancesDir => Path.Combine(AgentDir, "instances");
         public static string RunsDir => Path.Combine(AgentDir, "runs");
+
+        public static string RecordingsDir => Path.Combine(AgentDir, "recordings");
 
         /// <summary>
         /// Registered hosts whose process metadata or named pipe establishes liveness, newest first.
@@ -237,6 +267,9 @@ namespace pyRevitCLI {
                         Engine = data.Value<string>("engine"),
                         EngineVersion = data.Value<string>("engine_version"),
                         Commit = data.Value<string>("commit"),
+                        BinCommit = data.Value<string>("bin_commit"),
+                        BinStale = data.Value<bool?>("bin_stale") ?? false,
+                        Branch = data.Value<string>("branch"),
                         ConfigRoot = data.Value<string>("config_root"),
                         PerLaunch = data.Value<bool?>("per_launch") ?? false,
                     };
@@ -360,8 +393,9 @@ namespace pyRevitCLI {
         /// See <see cref="Call"/>; <c>revit_busy</c> when the pipe isn't accepted in time and
         /// <c>no_answer</c> when the answer doesn't come in time.
         /// </exception>
-        public static void Ping(AgentInstance instance) {
-            Call(instance, "ping", answerTimeoutMs: PingTimeoutMs, connectTimeoutMs: PingConnectTimeoutMs);
+        public static JObject Ping(AgentInstance instance, bool identity = false) {
+            var parameters = identity ? new JObject { ["identity"] = true } : null;
+            return Call(instance, "ping", parameters, answerTimeoutMs: PingTimeoutMs, connectTimeoutMs: PingConnectTimeoutMs) as JObject;
         }
 
         /// <summary>
@@ -375,6 +409,12 @@ namespace pyRevitCLI {
         /// Important: giving up on the answer, through <paramref name="cancellation"/> or
         /// <paramref name="answerTimeoutMs"/>, only closes the connection. A request already sent
         /// keeps running in Revit, so its outcome is <see cref="AgentOutcome.Unknown"/>.
+        /// The exception is a modify run waiting at the approval prompt: after the disconnect the host
+        /// tries to close the prompt as No and records <c>discarded_caller_gone</c> when it found the
+        /// prompt and the rollback succeeded. If it did not find the prompt within about two seconds the
+        /// prompt stays up and the user may still approve; if the rollback failed the record is
+        /// <c>rollback_incomplete</c> and changes may remain.
+        /// A caller that must name the request in its own errors passes <paramref name="requestId"/>.
         /// </remarks>
         /// <exception cref="AgentClientException">
         /// <c>cancelled</c> when <paramref name="cancellation"/> fires and <c>no_answer</c> when
@@ -382,8 +422,9 @@ namespace pyRevitCLI {
         /// </exception>
         public static JToken Call(
             AgentInstance instance, string method, JObject parameters = null,
-            CancellationToken cancellation = default, int? answerTimeoutMs = null, int? connectTimeoutMs = null) {
-            var requestId = NewRequestId();
+            CancellationToken cancellation = default, int? answerTimeoutMs = null, int? connectTimeoutMs = null,
+            string requestId = null) {
+            requestId ??= NewRequestId();
             var request = new JObject {
                 ["jsonrpc"] = "2.0",
                 ["id"] = requestId,
@@ -399,12 +440,12 @@ namespace pyRevitCLI {
                     pipe.ConnectAsync(connectTimeoutMs ?? ConnectTimeoutMs, cancellation).GetAwaiter().GetResult();
                     RequireServerProcess(pipe, instance);
                     var writer = new StreamWriter(pipe, Utf8) { AutoFlush = true, NewLine = "\n" };
-                    var reader = new StreamReader(pipe, Utf8);
+                    var reader = new BoundedLineReader(new StreamReader(pipe, Utf8));
                     writer.WriteLine(request.ToString(Formatting.None));
                     sent = true;
                     if (answerTimeoutMs.HasValue)
                         answer.CancelAfter(answerTimeoutMs.Value);
-                    responseLine = reader.ReadLineAsync(answer.Token).AsTask().GetAwaiter().GetResult();
+                    responseLine = reader.ReadLineAsync(answer.Token).GetAwaiter().GetResult();
                 }
             }
             catch (OperationCanceledException) when (cancellation.IsCancellationRequested) {
@@ -437,6 +478,20 @@ namespace pyRevitCLI {
                     sent ? AgentOutcome.Unknown : AgentOutcome.NotSent,
                     requestId);
             }
+            catch (InvalidDataException ex) {
+                throw new AgentClientException(
+                    "pipe_error",
+                    "Revit's answer was refused: " + ex.Message + LostAnswerNotice(sent),
+                    AgentOutcome.Unknown,
+                    requestId);
+            }
+            catch (Exception ex) when (ex is not AgentClientException) {
+                throw new AgentClientException(
+                    "pipe_error",
+                    "Connection to Revit failed (" + ex.GetType().Name + ")." + LostAnswerNotice(sent),
+                    sent ? AgentOutcome.Unknown : AgentOutcome.NotSent,
+                    requestId);
+            }
 
             if (responseLine == null)
                 throw new AgentClientException(
@@ -447,7 +502,7 @@ namespace pyRevitCLI {
 
             JObject response;
             try {
-                response = JObject.Parse(responseLine);
+                response = JsonText.Parse(responseLine) as JObject ?? throw new JsonReaderException("The answer is not a JSON object.");
             }
             catch (JsonException) {
                 throw new AgentClientException(
@@ -478,7 +533,7 @@ namespace pyRevitCLI {
             return "req-" + Guid.NewGuid().ToString("N").Substring(0, 12);
         }
 
-        private static string LostAnswerNotice(bool sent) {
+        internal static string LostAnswerNotice(bool sent) {
             return sent
                 ? " The request was sent and its outcome is unknown: it may have run or may still run. "
                     + "Look it up by its request id before sending it again."

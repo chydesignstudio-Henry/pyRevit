@@ -5,7 +5,7 @@ using Autodesk.Revit.DB.Events;
 using pyRevitLabs.Json.Linq;
 
 namespace Autodesk.Revit.DB {
-    internal enum TransactionStatus { Uninitialized, Started, RolledBack, Committed }
+    internal enum TransactionStatus { Uninitialized, Started, RolledBack, Committed, Pending }
     internal enum FailureSeverity { Warning, Error }
     internal enum FailureProcessingResult { Continue, ProceedWithRollBack }
     internal sealed class ElementId { }
@@ -15,7 +15,9 @@ namespace Autodesk.Revit.DB {
         public string Name { get; set; }
     }
     internal sealed class Family : Element { }
-    internal sealed class FamilySymbol : Element { }
+    internal class ElementType : Element { }
+    internal sealed class FamilySymbol : ElementType { }
+    internal sealed class WallType : ElementType { }
     internal sealed class Document {
         public string Title { get; set; } = "Test document";
         public string PathName { get; set; } = "";
@@ -30,7 +32,13 @@ namespace Autodesk.Revit.DB {
         public bool ThrowOnDispose { get; set; }
         public TransactionStatus RollbackStatus { get; set; } = TransactionStatus.RolledBack;
         public TransactionStatus StartStatus { get; set; } = TransactionStatus.Started;
+        public TransactionStatus AssimilateStatus { get; set; } = TransactionStatus.Committed;
+        public TransactionStatus CommitStatus { get; set; } = TransactionStatus.Committed;
         public int RollbackCalls { get; set; }
+        public TransactionStatus TransactionStartStatus { get; set; } = TransactionStatus.Started;
+        public int TransactionStarts { get; set; }
+        public int OpenTransactions { get; set; }
+        public int TransactionsRolledBackOnDispose { get; set; }
         public bool Close(bool save) {
             if (save)
                 throw new InvalidOperationException("Cleanup must never save.");
@@ -59,10 +67,39 @@ namespace Autodesk.Revit.DB {
                 throw new InvalidOperationException("Rollback failed.");
             return status = document.RollbackStatus;
         }
-        public void Assimilate() { status = TransactionStatus.Committed; }
+        public TransactionStatus Assimilate() => status = document.AssimilateStatus;
         public void Dispose() {
             if (document.ThrowOnDispose)
                 throw new InvalidOperationException("Dispose failed.");
+        }
+    }
+    internal sealed class Transaction : IDisposable {
+        private readonly Document document;
+        public Transaction(Document document, string name) { this.document = document; }
+        private bool open;
+        public TransactionStatus Start() {
+            document.TransactionStarts++;
+            if (document.TransactionStartStatus != TransactionStatus.Started)
+                return document.TransactionStartStatus;
+            open = true;
+            document.OpenTransactions++;
+            return TransactionStatus.Started;
+        }
+        public TransactionStatus Commit() {
+            Close();
+            return document.CommitStatus;
+        }
+        public void Dispose() {
+            if (!open)
+                return;
+            Close();
+            document.TransactionsRolledBackOnDispose++;
+        }
+        private void Close() {
+            if (!open)
+                return;
+            open = false;
+            document.OpenTransactions--;
         }
     }
     internal sealed class FailureMessage {
@@ -94,6 +131,11 @@ namespace Autodesk.Revit.DB {
         public void DeleteWarning(FailureMessage message) { DeletedWarnings.Add(message); }
     }
 }
+namespace Autodesk.Revit.Exceptions {
+    internal class ApplicationException : Exception {
+        public ApplicationException(string message) : base(message) { }
+    }
+}
 namespace Autodesk.Revit.DB.Events {
     internal class RevitAPIPreEventArgs : EventArgs {
         public bool Cancellable { get; set; } = true;
@@ -108,7 +150,10 @@ namespace Autodesk.Revit.DB.Events {
     internal sealed class DocumentCreatedEventArgs : DocumentEventArgs { }
     internal sealed class DocumentOpenedEventArgs : DocumentEventArgs { }
     internal sealed class DocumentPrintingEventArgs : DocumentEventArgs { }
-    internal sealed class FileExportingEventArgs : RevitAPIPreEventArgs { }
+    internal sealed class FileExportingEventArgs : RevitAPIPreEventArgs {
+        public string Path { get; set; }
+        public bool BackgroundOperation { get; set; }
+    }
     internal sealed class ViewExportingEventArgs : RevitAPIPreEventArgs { }
     internal sealed class DocumentChangedEventArgs : EventArgs {
         public Document Document { get; set; }
@@ -187,8 +232,8 @@ namespace Autodesk.Revit.ApplicationServices {
             DocumentSavingAs?.Invoke(this, args);
             return !args.Cancelled;
         }
-        public bool ExportFile() {
-            var args = new FileExportingEventArgs();
+        public bool ExportFile(string path = null, bool background = false) {
+            var args = new FileExportingEventArgs { Path = path, BackgroundOperation = background };
             FileExporting?.Invoke(this, args);
             return !args.Cancelled;
         }
@@ -242,5 +287,15 @@ namespace PyRevitLabs.PyRevit.Runtime.Agent {
 namespace pyRevitLabs.PyRevit {
     internal static class PyRevitConfigs {
         public static string GetAgentEngine() => "ironpython";
+    }
+}
+namespace pyRevitLabs.NLog {
+    internal sealed class Logger {
+        public void Error(string message, params object[] args) { }
+        public void Warn(string message, params object[] args) { }
+        public void Debug(string message, params object[] args) { }
+    }
+    internal static class LogManager {
+        public static Logger GetCurrentClassLogger() => new Logger();
     }
 }

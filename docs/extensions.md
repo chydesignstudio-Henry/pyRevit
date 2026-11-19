@@ -15,6 +15,8 @@ Extensions follow this hierarchy:
 MyExtension.extension/
   extension.json          # optional extension-level manifest
   startup.py               # optional, runs once when the extension loads
+  commands/                # optional, runner commands (*_command.py) for `pyrevit run`
+  checks/                  # optional, preflight checks
   MyTab.tab/
     MyPanel.panel/
       MyButton.pushbutton/
@@ -23,11 +25,33 @@ MyExtension.extension/
         icon.png             # button icon
 ```
 
-Supported bundle types (folder postfix): `pushbutton`, `smartbutton`, `pulldown`, `splitbutton`, `splitpushbutton`, `panelbutton`, `stack`, `linkbutton`, `invokebutton`, `nobutton`, `content`, `urlbutton`, `combobox`.
+Supported bundle types (folder postfix): `pushbutton`, `smartbutton`, `pulldown`, `splitbutton`, `splitpushbutton`, `panelbutton`, `stack`, `linkbutton`, `invokebutton`, `nobutton`, `content`, `urlbutton`, `combobox`, `checkbox`.
 
 ???+ info
 
     Postfixes and every other constant on this page are defined in [pyrevit.extensions][] (`pyrevitlib/pyrevit/extensions/__init__.py`).
+
+A `checkbox` bundle adds a ribbon checkbox. Its `script.py` can define `__chk_init__(ctx)`, which runs when the ribbon loads, and `__chk_on_change__(sender, args, ctx)`, which runs each time `ctx.is_checked` changes after `__chk_init__` returns. Both run outside Revit API context, so they must not start transactions. All checkboxes run in one IronPython engine, but each keeps its own copy of the modules it imports from its bundle's `lib` folders and from library extensions, so two checkboxes can ship modules with the same name; pyRevit and the standard library are shared. Checkboxes stack only with other checkboxes: in a `stack` that also holds other items, the checkboxes are placed beside the stack and a warning is logged.
+
+A handler can also come from another module, as in `from chk_handlers import on_change as __chk_on_change__`, so several checkboxes can share one. `EXEC_PARAMS`, and with it `script.get_config()`, still resolves the checkbox the handler runs for.
+
+Module isolation has three gaps:
+
+- `sys.path` is a new list each time a checkbox's code starts to run, so a reference kept to an earlier list, such as `from sys import path` at the top of the script, does not change the live path in later calls. Use `sys.path` itself.
+- A module from `site-packages` or `pyrevitlib` stays shared, so a checkbox whose `lib` has a module with the same name gets the shared one when another checkbox imported it first.
+- A submodule that a checkbox loads into a shared package, by extending the package's `__path__`, stays bound to that package for every checkbox.
+
+The `ctx` that both handlers receive has these members:
+
+| Member | What it is |
+|---|---|
+| `is_checked` | The checked state. Setting a new value raises `__chk_on_change__` again, the same way a click does, except inside `__chk_init__`: the change handler is attached only after `__chk_init__` returns, so restoring a saved state there does not raise it. |
+| `text`, `enabled`, `visible` | The checkbox's label, and whether it is enabled and shown. All three can be set. |
+| `checkbox` | The AdWindows `RibbonCheckBox` itself. |
+| `uiapp` | Revit's `UIApplication`. |
+| `directory` | The bundle folder. |
+| `name`, `display_name` | The bundle folder name without its suffix, without spaces (`TestCheckBox`) and with them (`Test CheckBox`). |
+| `user_data` | A .NET `Dictionary[str, object]` that keeps data between calls until the next pyRevit reload. On IronPython 2.7 it has no `get` or `setdefault`, so check keys with `ctx.user_data.ContainsKey(key)` and read them with `ctx.user_data[key]`. |
 
 ## Bundle files
 
@@ -58,7 +82,7 @@ Common keys:
 - `layout` — reorders/nests child buttons instead of relying on folder order; use `---` for a separator and `>>>` to start a slideout.
 - `background` / `background_dark` — panel bundles only; see [Panel background colors](#panel-background-colors).
 
-Bundle-type-specific keys: `modules` (link buttons), `assembly` / `command_class` / `availability_class` (invoke/link buttons), `hyperlink` (URL buttons).
+Bundle-type-specific keys: `modules` (link buttons), `assembly` / `command_class` / `availability_class` (invoke/link buttons), `hyperlink` (URL buttons), `checked` (checkboxes; the starting state, `false` by default).
 
 ???+ info
 
@@ -120,6 +144,40 @@ A `hooks/` folder (at the bundle, tab, panel, or extension level) can hold Pytho
 
 There is no exhaustive published list of event names — `extensions/pyRevitDevHooks.extension/hooks/` has one example script per supported event and is the most complete reference. Hook registration is handled by `pyrevitlib/pyrevit/loader/hooks.py`. A more detailed list of event names is published [here](https://pyrevitlabs.notion.site/Extension-Hooks-b771ecf65f6a45fe87ae12beab2a73a6).
 
+## Runner commands
+
+A `commands/` folder at the root of a UI extension holds scripts that the CLI can run against Revit models without a ribbon button. A file is a runner command when it ends in `_command.py` (case-insensitive); its name is the file name without that trailing postfix, so `commands/list_views_command.py` is the command `list_views` and `Foo_Command.PY` is the command `Foo`. Other files in the folder, and subfolders, are ignored. The constants are `ExtensionUICommandsDirName` and `ExtensionUICommandPostfix` in `PyRevitConsts.cs`, and the scan is `PyRevitExtension.GetCommands()`.
+
+```text
+pyrevit run commands                              # list the commands of every registered clone and installed extension
+pyrevit run list_views "C:\models\house.rvt"      # run a command by name on a model
+pyrevit run list_views --models=models.txt --revit=2026   # run it on every model listed in a text file, one path per line
+pyrevit run C:\scripts\one_off.py "house.rvt"     # a path to a .py file runs that script instead of looking up a command
+pyrevit run list_views --revit=2026 --inputs="{\"level\": \"L1\"}"   # hand the script a JSON object as __inputs__
+pyrevit run list_views --revit=2026 --inputs-file=inputs.json          # the same, read from a JSON file
+```
+
+- The name lookup is case-insensitive. It searches the extensions of the clone attached to the target Revit first, then installed extensions. The first match wins; when a later extension defines the same command name, `pyrevit run` prints a warning to standard error naming the file that runs and the file it shadows.
+- The runner starts Revit from a generated journal with the attached pyRevit and quits Revit when the script ends. Without `--revit`, the Revit version comes from the model, or is the newest installed; the `--models` form always requires `--revit`.
+- The script runs in a full-frame engine with output windows suppressed; what the script prints and logs (`script.get_logger()`) goes to the run's log file. Besides the usual builtins it gets `__models__` (the model paths passed on the command line), `__batchexec__` (`True`) and `__logfile__` (the run's log file).
+- `--inputs=<json>` or `--inputs-file=<path>` hands the script structured input, like `pyrevit agent run --inputs`. The text must be a JSON object; the CLI refuses anything else before Revit starts. The script gets it as `__inputs__`, the JSON text (`"{}"` when neither option is passed), so `inputs = json.loads(__inputs__)` works the same on every engine. The text travels in the journal, so keep it small and pass larger data by path.
+- The script opens the models itself (`HOST_APP.app.OpenDocumentFile(path)`) and is responsible for saving and closing them. Error dialogs are dismissed automatically unless `--allowdialogs` is passed.
+
+`extensions/pyRevitDevTools.extension/commands/list_views_command.py` is the reference example.
+
+## Preflight checks
+
+A `checks/` folder at the root of a UI extension holds [preflight][pyrevit.preflight] checks: model-quality scripts offered by the *Preflight Checks* button in pyRevitTools. Only files ending in `_check.py` (case-insensitive) are imported, at the time the dialog opens. `checks/` is not on `sys.path`, and the checks are loaded with the import path of the Preflight Checks button, which belongs to pyRevitTools. A check can import from `pyrevitlib` and from pyRevitTools' own `lib/` folders, but a check in any other UI extension cannot import from that extension's `lib/`; a failing import raises in the loader and the dialog does not open. Keep checks from other extensions self-contained. Other file types (JSON data, `locale/` resources) can stay in `checks/`; the loader ignores them and the checks read them by path.
+
+Each class in a file that derives from `pyrevit.preflight.PreflightTestCase` becomes one entry in the dialog:
+
+- The entry name is the class attribute `name`, or, when `name` is absent, the file name with the trailing `_check.py` removed (`model_check_views_check.py` becomes `model_check_views`).
+- The class docstring is required. Its first line is the subtitle and the remaining lines are the description; a missing docstring is logged as an error.
+- The optional class attribute `author` overrides the extension's author.
+- `setUp(doc, output)`, `startTest(doc, output)`, `tearDown(doc, output)` and `doCleanups(doc, output)` run in that order on a fresh instance against the active document. An exception in any of them aborts the run, so `tearDown` and `doCleanups` are skipped after a failure; don't rely on them for cleanup that must always happen.
+
+Checks from all enabled UI extensions are merged into one list; a disabled extension, such as the default-disabled pyRevitDevTools, contributes none. `extensions/pyRevitDevTools.extension/checks/view_count_check.py` is the reference example, and the checks in `extensions/pyRevitTools.extension/checks/` show localized, multi-check files.
+
 ## The `__revit__` host handle
 
 Every script pyRevit runs — commands, event hooks, smart buttons, combo boxes — gets a `__revit__` builtin. The contract is:
@@ -128,7 +186,7 @@ Every script pyRevit runs — commands, event hooks, smart buttons, combo boxes 
 
 Revit hands subscribers four unrelated application types depending on the event that fired: `UIApplication`, `Application`, `UIControlledApplication` and `ControlledApplication`. Every `Application_*` hook is registered on `uiApp.Application`, so its sender is DB-only.
 
-`PyRevitLabs.PyRevit.Runtime.RevitAppResolver` now funnels every handle into one shape before it reaches a script:
+`PyRevitLabs.PyRevit.Runtime.RevitAppResolver` funnels every handle into one shape before it reaches a script:
 
 | `__eventsender__` type | How `__revit__` is derived |
 |---|---|

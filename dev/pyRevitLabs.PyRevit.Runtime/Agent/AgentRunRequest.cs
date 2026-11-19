@@ -2,7 +2,9 @@ using System;
 using System.Diagnostics;
 using System.IO;
 using System.Text.RegularExpressions;
+using System.Threading;
 
+using pyRevitLabs.Common;
 using pyRevitLabs.Json;
 using pyRevitLabs.Json.Linq;
 using pyRevitLabs.PyRevit;
@@ -38,10 +40,22 @@ namespace PyRevitLabs.PyRevit.Runtime.Agent {
         public string Workspace { get; private set; }
 
         /// <summary>
+        /// Title or path of the document the caller inspected. When set, the run is refused with
+        /// <c>document_changed</c> unless it is the active document.
+        /// </summary>
+        public string Document { get; private set; }
+
+        /// <summary>
         /// The JSON-RPC <c>id</c> the client sent, kept in the run record so a caller that lost
         /// the answer can find what became of its request. Set by the request handler.
         /// </summary>
         public string RequestId { get; set; }
+
+        /// <summary>
+        /// Cancelled when the client that sent the request disconnects before the run's answer is
+        /// sent. Set by the request handler; <c>default</c> (never cancelled) for in-process requests.
+        /// </summary>
+        public CancellationToken CallerGone { get; set; }
 
         /// <summary>
         /// Seconds the script may run before the runner stops it. Covers script execution
@@ -69,26 +83,30 @@ namespace PyRevitLabs.PyRevit.Runtime.Agent {
         }
 
         public static AgentRunRequest FromJson(JObject parameters) {
-            var script = parameters.Value<string>("script");
+            var script = AgentParams.Get<string>(parameters, "script");
             if (string.IsNullOrWhiteSpace(script))
                 throw new AgentException("invalid_params", "'script' is required.");
 
             var inputs = parameters["inputs"];
-            var workspace = parameters.Value<string>("workspace");
+            if (inputs != null && inputs.Type != JTokenType.Null && inputs.Type != JTokenType.Object)
+                throw new AgentException("invalid_params", "'inputs' must be an object.");
+            var workspace = AgentParams.Get<string>(parameters, "workspace");
+            var document = AgentDocumentBinding.Parse(parameters["document"]);
             if (!string.IsNullOrWhiteSpace(workspace) && (!Path.IsPathRooted(workspace) || IsNetworkOrDevicePath(workspace) || !Directory.Exists(workspace)))
                 throw new AgentException("invalid_params", "'workspace' must be the absolute path of an existing local folder.");
-            var timeoutSeconds = parameters.Value<double?>("timeout_s") ?? DefaultTimeoutSeconds;
+            var timeoutSeconds = AgentParams.Get<double?>(parameters, "timeout_s") ?? DefaultTimeoutSeconds;
             if (double.IsNaN(timeoutSeconds) || timeoutSeconds <= 0 || timeoutSeconds > MaxTimeoutSeconds)
                 throw new AgentException("invalid_params", $"'timeout_s' must be more than 0 and at most {MaxTimeoutSeconds}.");
             return new AgentRunRequest {
                 Script = script,
-                Title = Shorten(TitleBreaks.Replace(parameters.Value<string>("title") ?? "Agent run", " ").Trim()),
-                Mode = ParseMode(parameters.Value<string>("mode")),
-                Engine = ParseEngine(parameters.Value<string>("engine")),
+                Title = Shorten(TitleBreaks.Replace(AgentParams.Get<string>(parameters, "title") ?? "Agent run", " ").Trim()),
+                Mode = ParseMode(AgentParams.Get<string>(parameters, "mode")),
+                Engine = ParseEngine(AgentParams.Get<string>(parameters, "engine")),
                 InputsJson = inputs == null || inputs.Type == JTokenType.Null
                     ? "{}"
                     : inputs.ToString(Formatting.None),
                 Workspace = string.IsNullOrWhiteSpace(workspace) ? null : Path.GetFullPath(workspace),
+                Document = document,
                 TimeoutSeconds = timeoutSeconds,
             };
         }
@@ -110,8 +128,9 @@ namespace PyRevitLabs.PyRevit.Runtime.Agent {
                 ["title"] = Title,
                 ["mode"] = ModeName,
                 ["engine"] = Engine == AgentEngine.CPython ? "cpython" : "ironpython",
-                ["inputs"] = JToken.Parse(InputsJson),
+                ["inputs"] = JsonText.Parse(InputsJson),
                 ["workspace"] = Workspace,
+                ["document"] = Document,
                 ["timeout_s"] = TimeoutSeconds,
                 ["request_id"] = RequestId,
             };

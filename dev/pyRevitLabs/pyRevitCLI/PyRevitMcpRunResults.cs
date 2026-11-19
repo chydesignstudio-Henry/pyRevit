@@ -58,6 +58,8 @@ namespace pyRevitCLI {
 
             if (run.Value<string>("mode") != "query")
                 compact["decision"] = run["decision"];
+            if (run["rollback_failure"]?.Type == JTokenType.String)
+                compact["rollback_failure"] = run["rollback_failure"];
             if (run["approval"] != null)
                 compact["approval"] = run["approval"];
 
@@ -81,6 +83,11 @@ namespace pyRevitCLI {
             CopyIfNotEmpty(run, compact, "failures");
             CopyIfNotEmpty(run, compact, "dialogs");
             CopyIfNotEmpty(run, compact, "blocked");
+            if (run["exports"] is JArray exports && exports.Count > 0) {
+                compact["exports"] = new JArray(exports.Take(MaxChangeIds));
+                if (exports.Count > MaxChangeIds)
+                    compact["exports_note"] = $"The run exported {exports.Count} files; this list stops at {MaxChangeIds}. get_run(run_id) lists them all.";
+            }
 
             if (run["engine"] is JObject engine)
                 compact["engine"] = engine["implementation"] + " " + engine["python"];
@@ -315,11 +322,12 @@ namespace pyRevitCLI {
         }
 
         private static JObject CompactChanges(JObject changes) {
-            var compact = new JObject {
-                ["added_count"] = changes["added_count"],
-                ["modified_count"] = changes["modified_count"],
-                ["deleted_count"] = changes["deleted_count"],
-            };
+            var compact = new JObject();
+            if (changes["summary"] is JValue summary && summary.Type == JTokenType.String)
+                compact["summary"] = summary;
+            compact["added_count"] = changes["added_count"];
+            compact["modified_count"] = changes["modified_count"];
+            compact["deleted_count"] = changes["deleted_count"];
             if (changes["by_category"] is JObject byCategory && byCategory.Count > 0)
                 compact["by_category"] = byCategory;
             if (changes["added"] is JArray added && added.Count > 0)

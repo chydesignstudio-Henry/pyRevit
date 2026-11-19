@@ -16,6 +16,15 @@ public static class PyRevitPaths
     public static string LabsSolution => Path.Combine(DevPath, "pyRevitLabs", "pyRevitLabs.sln");
     public static string LabsCliProject => Path.Combine(DevPath, "pyRevitLabs", "pyRevitCLI", "pyRevitCLI.csproj");
     public static string LabsDoctorProject => Path.Combine(DevPath, "pyRevitLabs", "pyRevitDoctor", "pyRevitDoctor.csproj");
+    /// <summary>
+    /// Gets the file name of the doctor executable, in <c>bin/</c> and as a release asset.
+    /// </summary>
+    /// <remarks>
+    /// Invariant: the release asset keeps this unversioned name. The docs name
+    /// <c>releases/latest/download/pyrevit-doctor.exe</c> as the permanent link, which only resolves while every release carries
+    /// an asset with exactly this name.
+    /// </remarks>
+    public static string DoctorExeName => "pyrevit-doctor.exe";
     public static string LoadersSolution => Path.Combine(DevPath, "pyRevitLoader", "pyRevitLoader.sln");
     public static string Loader2712Project => Path.Combine(DevPath, "pyRevitLoader", "pyRevitLoader.2712PR", "pyRevitLoader.2712PR.csproj");
     public static string Loader342Project => Path.Combine(DevPath, "pyRevitLoader", "pyRevitLoader.342", "pyRevitLoader.342.csproj");
@@ -29,6 +38,7 @@ public static class PyRevitPaths
     public static string CliTestProject => Path.Combine(DevPath, "pyRevitLabs", "tests", "pyRevitCLI.Tests", "pyRevitCLI.Tests.csproj");
     public static string AgentRuntimeTestProject => Path.Combine(DevPath, "pyRevitLabs", "tests", "pyRevitLabs.PyRevit.Runtime.Agent.Tests", "pyRevitLabs.PyRevit.Runtime.Agent.Tests.csproj");
     public static string RendererTestProject => Path.Combine(DevPath, "pyRevitLabs", "tests", "pyRevitLabs.PyRevit.Renderer.Tests", "pyRevitLabs.PyRevit.Renderer.Tests.csproj");
+    public static string DoctorTestProject => Path.Combine(DevPath, "pyRevitLabs", "tests", "pyRevitDoctor.Tests", "pyRevitDoctor.Tests.csproj");
     public static string ShellTestProject => Path.Combine(DevPath, "pyRevitLabs", "tests", "pyRevitLabs.PyRevit.Shell.Tests", "pyRevitLabs.PyRevit.Shell.Tests.csproj");
     public static string PyRevitUnitTestProject => Path.Combine(DevPath, "pyRevitLabs", "pyRevitLabs.UnitTests", "pyRevitLabs.UnitTests.csproj");
 
